@@ -1,14 +1,19 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/fangdingjun/go-log"
 	"github.com/fangdingjun/protolistener"
@@ -98,6 +103,71 @@ func (l *logout) Write(buf []byte) (int, error) {
 	return len(buf), nil
 }
 
+func initDomains(fn string) {
+	if fn == "" {
+		return
+	}
+	fp, err := os.Open(fn)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	defer fp.Close()
+	br := bufio.NewReader(fp)
+
+	proxyDomainMu.Lock()
+	defer proxyDomainMu.Unlock()
+
+	if needProxyDomains == nil {
+		needProxyDomains = make(map[string]int)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Errorln(err)
+			}
+			break
+		}
+		s := strings.Trim(line, " \t\r\n")
+		if s != "" {
+			log.Infof("add |%s|", s)
+			needProxyDomains[s] = 1
+		}
+	}
+}
+
+func reloadDomainThread(ctx context.Context, fn string) {
+	if fn == "" {
+		return
+	}
+	var t time.Time
+	st, err := os.Stat(fn)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	t = st.ModTime()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Second):
+		}
+		st, err := os.Stat(fn)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		t1 := st.ModTime()
+		if t1.After(t) {
+			log.Infof("reload domains")
+			t = t1
+			initDomains(fn)
+		}
+	}
+}
+
 func main() {
 	var configfile string
 	var loglevel string
@@ -133,12 +203,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	log.Infof("%+v", c)
 	err = initServer(c)
 	if err != nil {
 		log.Fatalln(err)
 	}
+	initProxy((c))
+	initDomains(c.Domains)
+	go reloadDomainThread(ctx, c.Domains)
 
 	trace.AuthRequest = func(r *http.Request) (bool, bool) {
 		return true, true
@@ -149,6 +224,9 @@ func main() {
 	select {
 	case sig := <-ch:
 		log.Errorf("received signal %s, exit", sig)
+		cancel()
+		time.Sleep(100 * time.Millisecond)
+	case <-ctx.Done():
 	}
 	log.Debug("exited.")
 }

@@ -1,5 +1,8 @@
 # vim: set ft=yaml:
 
+proxy_upstream: http://127.0.0.1:9090
+domains: a.txt
+
 # when provide certficate file, server will listen https and enable http2
 listen:
   -

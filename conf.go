@@ -10,6 +10,8 @@ type conf struct {
 	Listens []listen `yaml:"listen"`
 	Vhosts  []vhost  `yaml:"vhost"`
 	Proxy   proxycfg `yaml:"proxy"`
+	ProxyUp string   `yaml:"proxy_upstream"`
+	Domains string   `yaml:"domains"`
 }
 
 type proxycfg struct {

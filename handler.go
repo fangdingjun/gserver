@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fangdingjun/go-log"
@@ -27,6 +33,104 @@ var defaultTransport http.RoundTripper = &http.Transport{
 	MaxIdleConnsPerHost:   3,
 	DisableKeepAlives:     true,
 	ResponseHeaderTimeout: 2 * time.Second,
+}
+var defaultDialer = &net.Dialer{Timeout: 3 * time.Second}
+
+type proxyDialer struct {
+	u *url.URL
+}
+
+func (p *proxyDialer) Dial(r *http.Request) (net.Conn, error) {
+	conn, err := defaultDialer.Dial("tcp", p.u.Host)
+	if err != nil {
+		log.Errorln(err)
+		return nil, err
+	}
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\n\r\n", r.RequestURI)
+	tr := textproto.NewReader(bufio.NewReader(conn))
+	codeline, err := tr.ReadLine()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	ss := strings.SplitN(codeline, " ", 3)
+	code, err := strconv.Atoi(ss[1])
+	if err != nil || code != 200 {
+		conn.Close()
+		return nil, fmt.Errorf("dial failed")
+	}
+	_, err = tr.ReadMIMEHeader()
+	if err != nil {
+		log.Errorln(err)
+		conn.Close()
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+var defaultProxyDial *proxyDialer
+
+var needProxyDomains map[string]int
+var proxyDomainMu sync.Mutex
+
+func needProxy(r *http.Request) bool {
+	host, _, _ := net.SplitHostPort(r.RequestURI)
+
+	proxyDomainMu.Lock()
+	defer proxyDomainMu.Unlock()
+
+	for k := range needProxyDomains {
+		if strings.HasSuffix(host, k) {
+			log.Debugf("%s through proxy", host)
+			return true
+		}
+	}
+	return false
+}
+
+func initProxy(c *conf) {
+	if c.ProxyUp != "" {
+		u, err := url.Parse(c.ProxyUp)
+		if err != nil {
+			log.Errorln(err)
+			return
+		}
+		log.Infof("proxy %s", u.Host)
+		defaultProxyDial = &proxyDialer{u: u}
+	}
+}
+
+type logWriter struct {
+	mu sync.Mutex
+	fp *os.File
+}
+
+func (l *logWriter) log(s string) error {
+	if l.fp == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	fmt.Fprintf(l.fp, "%s\n", s)
+	return nil
+}
+
+func (l *logWriter) Close() error {
+	l.fp.Close()
+	return nil
+}
+
+var failLog *logWriter
+
+func init() {
+	failLog = &logWriter{}
+	fp, err := os.OpenFile("failed_domains.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Errorln(err)
+		return
+	}
+	failLog.fp = fp
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -81,6 +185,8 @@ func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var err error
 
+	log.Infof("%s %s", r.Method, r.RequestURI)
+
 	r.Header.Del("proxy-connection")
 	r.Header.Del("proxy-authorization")
 
@@ -100,7 +206,8 @@ func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err = defaultTransport.RoundTrip(r)
 	if err != nil {
 		h.events.Errorf("roundtrip %s, error %s", r.RequestURI, err)
-		log.Errorf("RoundTrip: %s", err)
+		log.Errorf("RoundTrip %s: %s", r.RequestURI, err)
+		failLog.log(r.RequestURI)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -134,6 +241,8 @@ func (fw flushWriter) Write(buf []byte) (int, error) {
 func (h *handler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	host := r.RequestURI
 
+	log.Infof("%s %s", r.Method, r.RequestURI)
+
 	if r.ProtoMajor == 2 {
 		host = r.URL.Host
 	}
@@ -145,13 +254,23 @@ func (h *handler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	var conn net.Conn
 	var err error
 
-	conn, err = net.Dial("tcp", host)
-	if err != nil {
-		h.events.Errorf("dial %s, error %s", host, err)
-		log.Errorf("net.dial: %s", err)
-		msg := fmt.Sprintf("dial to %s failed: %s", host, err)
-		http.Error(w, msg, http.StatusServiceUnavailable)
-		return
+	if needProxy(r) && defaultProxyDial != nil {
+		conn, err = defaultProxyDial.Dial(r)
+		if err != nil {
+			log.Errorln(err)
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		conn, err = defaultDialer.Dial("tcp", host)
+		if err != nil {
+			h.events.Errorf("dial %s, error %s", host, err)
+			log.Errorf("net.dial %s: %s", host, err)
+			msg := fmt.Sprintf("dial to %s failed: %s", host, err)
+			failLog.log(host)
+			http.Error(w, msg, http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	if r.ProtoMajor == 1 {
