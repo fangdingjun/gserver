@@ -7,11 +7,15 @@ import (
 )
 
 type conf struct {
-	Listens []listen `yaml:"listen"`
-	Vhosts  []vhost  `yaml:"vhost"`
-	Proxy   proxycfg `yaml:"proxy"`
-	ProxyUp string   `yaml:"proxy_upstream"`
-	Domains string   `yaml:"domains"`
+	Listens        []listen `yaml:"listen"`
+	Proxy          proxycfg `yaml:"proxy"`
+	ProxyUp        string   `yaml:"proxy_upstream"`
+	Domains        string   `yaml:"proxy_domains"`
+	NoProxyDomains string   `yaml:"no_proxy_domains"`
+	Docroot        string   `yaml:"docroot"`
+	PacTmpl        string   `yaml:"pac_tmpl"`
+	ProxyDest      string   `yaml:"proxy_dest"`
+	ProxyDefault   string   `yaml:"proxy_default"`
 }
 
 type proxycfg struct {

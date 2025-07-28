@@ -1,0 +1,53 @@
+var hosts = { 
+{{ range  $key,$value := .ProxiedHosts}} "{{- $key -}}":{{$value}}, {{end}} 
+}
+
+var noProxies = {
+{{ range $key,$value:= .NoProxiedHosts}} "{{- $key -}}":{{$value}}, {{end}}
+ }
+
+var proxy = "PROXY {{.Proxy}}";
+var defaultProxy = "PROXY {{.Default}}";
+
+function FindProxyForURL(url, host) {
+    // Connect directly if the host IP is within a specific range
+    if (isInNet(host, "10.0.0.0", "255.0.0.0")) {
+        return "DIRECT";
+    }
+    if (isInNet(host, "127.0.0.0", "255.0.0.0")) {
+        return "DIRECT";
+    }
+    if (isInNet(host, "192.168.0.0", "255.255.0.0")) {
+        return "DIRECT";
+    }
+    if (isInNet(host, "172.16.0.0", "255.240.0.0")) {
+        return "DIRECT";
+    }
+
+    var b = host;
+    while (b.length > 0) {
+        if (noProxies[b]) {
+            return "DIRECT";
+        }
+        var i = b.indexOf(".");
+        if (i < 0) {
+            break;
+        }
+        b = b.substring(i + 1);
+    }
+
+    var a = host;
+    while (a.length > 0) {
+        if (hosts[a]) {
+            return proxy;
+        }
+        var i = a.indexOf(".");
+        if (i < 0) {
+            break;
+        }
+        a = a.substring(i + 1);
+    }
+
+
+    return defaultProxy;
+}

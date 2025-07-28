@@ -1,28 +1,21 @@
 # vim: set ft=yaml:
 
 proxy_upstream: http://127.0.0.1:9090
-domains: a.txt
+proxy_domains: a.txt
+no_proxy_domains: b.txt
+pac_tmpl: proxy.tmpl
+proxy_dest: "127.0.0.1:9999"
+proxy_default: "127.0.0.1:9001"
 
 # when provide certficate file, server will listen https and enable http2
 listen:
-  -
-    addr: 0.0.0.0
+  - addr: 0.0.0.0
     port: 9001
     certificates:
-  -
-    addr: 0.0.0.0
-    port: 9002
-    certificates:
-      -
-        certfile: /etc/letsencrypt/live/ratafee.nl/fullchain.pem
-        keyfile: /etc/letsencrypt/live/ratafee.nl/privkey.pem
 
 # virtual host support
-vhost:
-  -
-    hostname: www.ratafee.nl
-    docroot: /srv/www
-    proxypass: http://nginx:80/
+docroot: /srv/www
+
 proxy:
   http1-proxy: false
   http2-proxy: true
