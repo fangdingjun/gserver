@@ -57,7 +57,7 @@ func (p *proxyDialer) Dial(r *http.Request) (net.Conn, error) {
 	code, err := strconv.Atoi(ss[1])
 	if err != nil || code != 200 {
 		conn.Close()
-		return nil, fmt.Errorf("dial failed")
+		return nil, fmt.Errorf("dial to %s failed, code %d, %v", r.RequestURI, code, err)
 	}
 	_, err = tr.ReadMIMEHeader()
 	if err != nil {
@@ -75,14 +75,23 @@ var needProxyDomains map[string]int
 var proxyDomainMu sync.Mutex
 
 func needProxy(r *http.Request) bool {
-	host, _, _ := net.SplitHostPort(r.RequestURI)
+	var uri string
+	if r.Method == http.MethodConnect {
+		uri = r.RequestURI
+	} else {
+		uri = r.URL.Host
+		if !strings.Contains(uri, ":") {
+			uri = uri + ":80"
+		}
+	}
+	host, _, _ := net.SplitHostPort(uri)
 
 	proxyDomainMu.Lock()
 	defer proxyDomainMu.Unlock()
 
 	for k := range needProxyDomains {
 		if strings.HasSuffix(host, k) {
-			log.Debugf("%s through proxy", host)
+			//log.Debugf("%s through proxy", host)
 			return true
 		}
 	}
@@ -96,7 +105,7 @@ func initProxy(c *conf) {
 			log.Errorln(err)
 			return
 		}
-		log.Infof("proxy %s", u.Host)
+		//log.Infof("proxy %s", u.Host)
 		defaultProxyDial = &proxyDialer{u: u}
 	}
 }
@@ -133,27 +142,27 @@ func init() {
 	failLog.fp = fp
 }
 
+func (h *handler) serveLocalRequest(w http.ResponseWriter, r *http.Request) {
+	if h.handler != nil {
+		h.handler.ServeHTTP(w, r)
+	} else {
+		http.DefaultServeMux.ServeHTTP(w, r)
+	}
+}
+
 // ServeHTTP implements the http.Handler interface
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// http/1.1 local request
 	if r.ProtoMajor == 1 && r.RequestURI[0] == '/' {
 		h.events.Printf("http11 local request %s", r.URL.Path)
-		if h.handler != nil {
-			h.handler.ServeHTTP(w, r)
-		} else {
-			http.DefaultServeMux.ServeHTTP(w, r)
-		}
+		h.serveLocalRequest(w, r)
 		return
 	}
 
 	// http/2.0 local request
 	if r.ProtoMajor == 2 && h.isLocalRequest(r) {
 		h.events.Printf("http2 local request %s", r.URL.Path)
-		if h.handler != nil {
-			h.handler.ServeHTTP(w, r)
-		} else {
-			http.DefaultServeMux.ServeHTTP(w, r)
-		}
+		h.serveLocalRequest(w, r)
 		return
 	}
 
@@ -180,12 +189,36 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *handler) replyClient(w http.ResponseWriter, r *http.Request, resp *http.Response) {
+	if resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 303 ||
+		resp.StatusCode == 307 || resp.StatusCode == 308 {
+		if loc := resp.Header.Get("location"); loc != "" {
+			if !strings.HasPrefix(loc, "http") {
+				loc = r.URL.Scheme + "://" + r.URL.Host + loc
+			}
+			http.Redirect(w, r, loc, resp.StatusCode)
+			return
+		}
+	}
 
+	hdr := w.Header()
+
+	resp.Header.Del("connection")
+
+	for k, v := range resp.Header {
+		for _, v1 := range v {
+			hdr.Add(k, v1)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	var resp *http.Response
 	var err error
 
-	log.Infof("%s %s", r.Method, r.RequestURI)
+	//log.Infof("%s %s", r.Method, r.RequestURI)
 
 	r.Header.Del("proxy-connection")
 	r.Header.Del("proxy-authorization")
@@ -196,12 +229,37 @@ func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		r.RequestURI = r.URL.String()
 		if r.Method != http.MethodPost && r.Method != http.MethodPut {
 			r.ContentLength = 0
-			r.Body.Close()
-			r.Body = nil
+			if r.Body != nil {
+				r.Body.Close()
+				r.Body = nil
+			}
 		}
 	}
 
 	h.events.Printf("%s proxy request %s", r.Proto, r.RequestURI)
+	if cfg.ProxyUp != "" && needProxy(r) {
+		u, _ := url.Parse(cfg.ProxyUp)
+		conn, err := defaultDialer.Dial("tcp", u.Host)
+		if err != nil {
+			log.Errorln(err)
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+		defer conn.Close()
+
+		r.WriteProxy(conn)
+		resp, err = http.ReadResponse(bufio.NewReader(conn), r)
+		if err != nil {
+			log.Errorln(err)
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+		defer resp.Body.Close()
+
+		h.replyClient(w, r, resp)
+
+		return
+	}
 
 	resp, err = defaultTransport.RoundTrip(r)
 	if err != nil {
@@ -214,18 +272,7 @@ func (h *handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	defer resp.Body.Close()
 
-	hdr := w.Header()
-
-	resp.Header.Del("connection")
-
-	for k, v := range resp.Header {
-		for _, v1 := range v {
-			hdr.Add(k, v1)
-		}
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	h.replyClient(w, r, resp)
 }
 
 type flushWriter struct {
@@ -241,7 +288,7 @@ func (fw flushWriter) Write(buf []byte) (int, error) {
 func (h *handler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 	host := r.RequestURI
 
-	log.Infof("%s %s", r.Method, r.RequestURI)
+	//log.Infof("%s %s", r.Method, r.RequestURI)
 
 	if r.ProtoMajor == 2 {
 		host = r.URL.Host
