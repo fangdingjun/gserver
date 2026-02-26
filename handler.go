@@ -309,6 +309,11 @@ func (h *handler) handleCONNECT(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
+		if !strings.Contains(host, ".") {
+			log.Errorf("invalid domain %s", host)
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
 		conn, err = defaultDialer.Dial("tcp", host)
 		if err != nil {
 			h.events.Errorf("dial %s, error %s", host, err)
